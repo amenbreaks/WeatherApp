@@ -37,67 +37,69 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.URL
 
-
-@Entity(tableName = "weather_data")
-data class WeatherData(
-    @PrimaryKey(autoGenerate = true)
-    val id: Long = 0L,
-    val latitude: Double,
-    val longitude: Double,
-    val date: String,
-    val maxTemperature: String,
-    val minTemperature: String
-)
-
-@Database(entities = [WeatherData::class], version = 1, exportSchema = false)
-abstract class WeatherDatabase : RoomDatabase() {
-    abstract fun weatherDao(): WeatherDao
-
-    companion object {
-        @Volatile
-        private var INSTANCE: WeatherDatabase? = null
-
-        fun getInstance(context: Context): WeatherDatabase {
-            return INSTANCE ?: synchronized(this) {
-                val instance = Room.databaseBuilder(
-                    context.applicationContext,
-                    WeatherDatabase::class.java,
-                    "weather_database"
-                ).build()
-                INSTANCE = instance
-                instance
-            }
-        }
-    }
-}
-
-
-@Dao
-interface WeatherDao {
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertWeatherData(weatherData: WeatherData)
-    @Query("SELECT * FROM weather_data WHERE latitude = :latitude AND longitude = :longitude AND date = :date")
-    suspend fun getWeatherData(latitude: Double, longitude: Double, date: String): WeatherData?
-}
-
-
-
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
             WeatherAppTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-//                    val weatherDatabase = WeatherDatabase.getInstance(applicationContext)
-//                    WeatherApp(weatherDatabase, applicationContext)
-                    WeatherApp()
+                    val weatherDatabase = WeatherDatabase.getInstance(applicationContext)
+                    WeatherApp(weatherDatabase, applicationContext)
                 }
             }
         }
     }
 
+    @Dao
+    interface WeatherDao {
+        @Insert(onConflict = OnConflictStrategy.REPLACE)
+        suspend fun insertWeatherData(weatherData: WeatherData)
+
+        @Query("SELECT * FROM weather_data WHERE latitude = :latitude AND longitude = :longitude AND date = :date")
+        suspend fun getWeatherData(latitude: Double, longitude: Double, date: String): WeatherData?
+
+        @Query("SELECT * FROM weather_data WHERE date = :date")
+        suspend fun getPastWeatherData(date: String): List<WeatherData>
+    }
+
+
+    @Entity(tableName = "weather_data")
+    data class WeatherData(
+        @PrimaryKey(autoGenerate = true)
+        val id: Long = 0L,
+        val latitude: Double,
+        val longitude: Double,
+        val date: String,
+        val maxTemperature: String,
+        val minTemperature: String
+    )
+
+
+    @Database(entities = [WeatherData::class], version = 1, exportSchema = false)
+    abstract class WeatherDatabase : RoomDatabase() {
+        abstract fun weatherDao(): WeatherDao
+
+        companion object {
+            @Volatile
+            private var INSTANCE: WeatherDatabase? = null
+
+            fun getInstance(context: Context): WeatherDatabase {
+                return INSTANCE ?: synchronized(this) {
+                    val instance = Room.databaseBuilder(
+                        context.applicationContext,
+                        WeatherDatabase::class.java,
+                        "weather_database"
+                    ).build()
+                    INSTANCE = instance
+                    instance
+                }
+            }
+        }
+    }
+
+
     @Composable
-    fun WeatherApp() {
+    fun WeatherApp(weatherDatabase: WeatherDatabase, context: Context) {
         var date by remember { mutableStateOf("") }
         var latitude by remember { mutableStateOf("") }
         var longitude by remember { mutableStateOf("") }
@@ -121,7 +123,7 @@ class MainActivity : ComponentActivity() {
             TextField(
                 value = latitude,
                 onValueChange = { latitude = it },
-                label = { Text(text = "Latitude") },
+                label = { Text(text = "Latitude (eg. 60, -20.4)") },
                 keyboardOptions = KeyboardOptions.Default.copy(imeAction = ImeAction.Done)
             )
 
@@ -139,7 +141,7 @@ class MainActivity : ComponentActivity() {
             TextField(
                 value = date,
                 onValueChange = { date = it },
-                label = { Text(text = "Date (YYYY-MM-DD)") },
+                label = { Text(text = "Date (YYYY-MM-DD") },
                 keyboardOptions = KeyboardOptions.Default.copy(imeAction = ImeAction.Done)
             )
 
@@ -151,7 +153,7 @@ class MainActivity : ComponentActivity() {
                         isLoading = true
                         // Launch coroutine to fetch weather data
                         coroutineScope.launch {
-                            fetchWeatherData(latitude.toDouble(), longitude.toDouble(), date) { maxTemp, minTemp ->
+                            fetchWeatherData(latitude.toDouble(), longitude.toDouble(), date, weatherDatabase, context) { maxTemp, minTemp ->
                                 maxTemperature = maxTemp
                                 minTemperature = minTemp
                                 isLoading = false
@@ -192,59 +194,72 @@ class MainActivity : ComponentActivity() {
         latitude: Double,
         longitude: Double,
         date: String,
-//        weatherDatabase: WeatherDatabase,
-//        context: Context,
+        weatherDatabase: WeatherDatabase,
+        context: Context,
         callback: (String, String) -> Unit
     ) {
         try {
-//            if (isNetworkAvailable(context)) {
-            val apiUrl =
-                "https://archive-api.open-meteo.com/v1/archive?latitude=$latitude&longitude=$longitude&start_date=$date&end_date=$date&hourly=temperature_2m"
+            if (isNetworkAvailable(context)) {
+                val apiUrl =
+                    "https://archive-api.open-meteo.com/v1/archive?latitude=$latitude&longitude=$longitude&start_date=$date&end_date=$date&hourly=temperature_2m"
 
-            // Log the API URL
-            println("Fetching weather data from: $apiUrl")
+                // Log the API URL
+                println("Fetching weather data from: $apiUrl")
 
-            val response = withContext(Dispatchers.IO) {
-                URL(apiUrl).readText()
+                val response = withContext(Dispatchers.IO) {
+                    URL(apiUrl).readText()
+                }
+
+                // Log the API response
+                println("Received response: $response")
+
+                val jsonResponse = JSONObject(response)
+                val hourlyData = jsonResponse.getJSONObject("hourly")
+                val temperatureList = hourlyData.getJSONArray("temperature_2m")
+                val temperatures = mutableListOf<Double>()
+                for (i in 0 until temperatureList.length()) {
+                    temperatures.add(temperatureList.getDouble(i))
+                }
+
+                // Calculate max and min temperatures
+                val maxTemp = temperatures.maxOrNull()?.toString() ?: ""
+                val minTemp = temperatures.minOrNull()?.toString() ?: ""
+
+                // Insert weather data into the database
+                val weatherData = WeatherData(
+                    latitude = latitude,
+                    longitude = longitude,
+                    date = date,
+                    maxTemperature = maxTemp,
+                    minTemperature = minTemp
+                )
+                weatherDatabase.weatherDao().insertWeatherData(weatherData)
+
+                callback(maxTemp, minTemp)
+            } else {
+                // If no internet, query the database
+                val storedWeatherData =
+                    weatherDatabase.weatherDao().getWeatherData(latitude, longitude, date)
+                if (storedWeatherData != null) {
+                    callback(storedWeatherData.maxTemperature, storedWeatherData.minTemperature)
+                } else {
+                    // If no matching data found in the database
+                    // Query past available values for the requested date
+                    val pastWeatherData =
+                        weatherDatabase.weatherDao().getPastWeatherData(date)
+                    if (pastWeatherData.isNotEmpty()) {
+                        // Calculate average of past available values
+                        val maxTempSum = pastWeatherData.map { it.maxTemperature.toDoubleOrNull() ?: 0.0 }.sum()
+                        val minTempSum = pastWeatherData.map { it.minTemperature.toDoubleOrNull() ?: 0.0 }.sum()
+                        val maxTempAverage = maxTempSum / pastWeatherData.size
+                        val minTempAverage = minTempSum / pastWeatherData.size
+                        callback(maxTempAverage.toString(), minTempAverage.toString())
+                    } else {
+                        // If no past data available, callback with dummy strings
+                        callback("Not Found", "Not Found")
+                    }
+                }
             }
-
-            // Log the API response
-            println("Received response: $response")
-
-            val jsonResponse = JSONObject(response)
-            val hourlyData = jsonResponse.getJSONObject("hourly")
-            val temperatureList = hourlyData.getJSONArray("temperature_2m")
-            val temperatures = mutableListOf<Double>()
-            for (i in 0 until temperatureList.length()) {
-                temperatures.add(temperatureList.getDouble(i))
-            }
-
-            // Calculate max and min temperatures
-            val maxTemp = temperatures.maxOrNull()?.toString() ?: ""
-            val minTemp = temperatures.minOrNull()?.toString() ?: ""
-
-            // Insert weather data into the database
-            val weatherData = WeatherData(
-                latitude = latitude,
-                longitude = longitude,
-                date = date,
-                maxTemperature = maxTemp,
-                minTemperature = minTemp
-            )
-//                weatherDatabase.weatherDao().insertWeatherData(weatherData)
-
-            callback(maxTemp, minTemp)
-//            } else {
-//                // If no internet, query the database
-//                val storedWeatherData =
-//                    weatherDatabase.weatherDao().getWeatherData(latitude, longitude, date)
-//                if (storedWeatherData != null) {
-//                    callback(storedWeatherData.maxTemperature, storedWeatherData.minTemperature)
-//                } else {
-//                    // If no matching data found in the database, callback with dummy strings
-//                    callback("Not Found", "Not Found")
-//                }
-//            }
         } catch (e: Exception) {
             // Log any exceptions that occur during the fetch operation
             println("Error fetching weather data: ${e.message}")
